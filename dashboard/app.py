@@ -1,7 +1,6 @@
 import sys
 import os
 
-# Fix path pour trouver src/
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import streamlit as st
@@ -13,63 +12,95 @@ from src.pricing import irs_npv, fx_option_price
 
 
 # ===============================
-# Dashboard Title
+# Config
 # ===============================
 
-st.title("FX & IRD Structuring Dashboard")
+st.set_page_config(layout="wide")
+
+st.title("🏦 Quant Structuring Desk Dashboard")
 
 
 # ===============================
-# IRS NPV Simulation
+# Monte Carlo Simulation
 # ===============================
 
-st.subheader("IRS NPV Scenarios")
+st.header("Monte Carlo Market Simulation")
 
 rates = simulate_rates()
+fx_paths = simulate_fx()
+
+st.write("Rate MC shape:", rates.shape)
+st.write("FX MC shape:", fx_paths.shape)
+
+
+# ===============================
+# IRD Pricing Engine
+# ===============================
+
+st.subheader("IRS NPV Distribution (Monte Carlo)")
+
+notional = 100e6
+fixed_rate = 0.025
+
+maturities = np.arange(1, 6)
+
+npv_scenarios = []
+
+# Precompute discount curve = moyenne MC (quant best practice ⭐)
+discount_curve = np.mean(rates, axis=0)
+
+for scenario in rates[:500]:
+
+    forward_curve = scenario[:len(maturities)]
+
+    npv = irs_npv(
+        notional,
+        fixed_rate,
+        forward_curve,
+        maturities,
+        lambda t, dc=discount_curve: dc[min(t-1, len(dc)-1)]
+    )
+
+    npv_scenarios.append(np.mean(npv))
+
+
+npv_scenarios = np.nan_to_num(np.array(npv_scenarios))
+
 
 fig1 = go.Figure()
 
-# On trace un NPV path par scénario
-for r in rates[:100]:
-
-    npv_path = irs_npv(
-        100e6,
-        0.025,
-        [0.02] * 5,
-        np.arange(1, 6),
-        lambda t, r=r: r[t - 1]
+fig1.add_trace(
+    go.Histogram(
+        x=npv_scenarios,
+        nbinsx=40
     )
+)
 
-    # Sécurité dimension (très important ⭐)
-    npv_path = np.atleast_1d(npv_path)
-
-    fig1.add_trace(
-        go.Scatter(
-            y=npv_path,
-            mode="lines"
-        )
-    )
-
-fig1.update_layout(title="IRS NPV Scenarios")
+fig1.update_layout(
+    title="IRS NPV Distribution",
+    xaxis_title="NPV",
+    yaxis_title="Frequency"
+)
 
 st.plotly_chart(fig1, use_container_width=True)
 
 
 # ===============================
-# FX Option Distribution
+# FX Options Pricing Engine
 # ===============================
 
 st.subheader("FX Option PnL Distribution")
 
-fx_paths = simulate_fx()
+spot_price = 1.12
+strike = 1.10
 
-prices = []
+fx_pnls = []
 
-for S in fx_paths[:100]:
+for path in fx_paths[:500]:
 
-    price = fx_option_price(
-        S[-1],
-        1.12,
+    pnl = fx_option_price(
+        path[-1],
+        strike,
         1,
         0.01,
         0.005,
@@ -77,12 +108,44 @@ for S in fx_paths[:100]:
         "call"
     )
 
-    prices.append(price)
+    if pnl is not None:
+        fx_pnls.append(pnl)
 
-fig2 = go.Figure([
-    go.Histogram(x=prices)
-])
+fx_pnls = np.nan_to_num(np.array(fx_pnls))
 
-fig2.update_layout(title="FX Option PnL Distribution")
+fig2 = go.Figure()
+fig2.add_trace(go.Histogram(x=fx_pnls, nbinsx=40))
+
+fig2.update_layout(
+    title="FX Option PnL Distribution",
+    xaxis_title="PnL",
+    yaxis_title="Frequency"
+)
 
 st.plotly_chart(fig2, use_container_width=True)
+
+
+# ===============================
+# Sample Path Visualization
+# ===============================
+
+st.subheader("Sample Market Paths")
+
+fig3 = go.Figure()
+
+# Plot 20 sample rate paths only (performance optimization ⭐)
+for path in rates[:20]:
+
+    fig3.add_trace(
+        go.Scatter(
+            y=path,
+            mode="lines",
+            opacity=0.7
+        )
+    )
+
+fig3.update_layout(
+    title="Sample Interest Rate Paths"
+)
+
+st.plotly_chart(fig3, use_container_width=True)
