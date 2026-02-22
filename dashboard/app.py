@@ -13,13 +13,12 @@ import streamlit as st
 import plotly.graph_objs as go
 import numpy as np
 
-
 # =========================
 # UI
 # =========================
 
 st.set_page_config(layout="wide")
-st.title("🏦 Quant Multi Asset Desk")
+st.title("🏦 FX & IRD Desk")
 
 st.sidebar.header("Market Params")
 
@@ -87,39 +86,70 @@ if run:
     )
 
     # =====================
-    # IRS Pricing
+    # Pricing Today (Reference Prices)
     # =====================
 
-    maturities = np.arange(1,6)
-
-    irs_pnls = irs_price_mc(
-        rates,
-        notional,
-        fixed_rate,
-        maturities,
-        np.mean(np.exp(-np.cumsum(rates,axis=1)*dt),axis=0)
+    fx_today_price = fx_option_bs(
+        spot,
+        strike,
+        1,
+        initial_rate,
+        0,
+        vol_fx
     )
 
     # =====================
-    # FX Pricing
+    # FX Option PnL Distribution
     # =====================
 
     fx_pnls = []
 
     for path in fx_paths:
 
-        fx_pnls.append(
-            fx_option_bs(
-                path[-1],
-                strike,
-                1,
-                initial_rate,
-                0,
-                vol_fx
+        price_scenario = fx_option_bs(
+            path[-1],
+            strike,
+            1,
+            initial_rate,
+            0,
+            vol_fx
+        )
+
+        fx_pnls.append(price_scenario - fx_today_price)
+
+    fx_pnls = np.array(fx_pnls)
+
+    # =====================
+    # IRS Pricing PnL
+    # =====================
+
+    irs_today = np.mean(
+        irs_price_mc(
+            np.full((n_scenarios,n_steps),initial_rate),
+            notional,
+            fixed_rate,
+            np.arange(1,6),
+            np.exp(-initial_rate*np.arange(1,6))
+        )
+    )
+
+    irs_pnls = []
+
+    for scenario_rates in rates:
+
+        price_scenario = np.mean(
+            irs_price_mc(
+                scenario_rates.reshape(1,-1),
+                notional,
+                fixed_rate,
+                np.arange(1,6),
+                np.exp(-np.cumsum(scenario_rates*dt))
             )
         )
 
-    fx_pnls = np.array(fx_pnls)
+        irs_pnls.append(price_scenario - irs_today)
+
+    irs_pnls = np.array(irs_pnls)
 
     # =====================
     # Risk Metrics
@@ -129,10 +159,12 @@ if run:
     var_fx, es_fx = var_es(fx_pnls)
 
     # =====================
-    # Greeks
+    # Greeks (corrected)
     # =====================
 
     bump = 0.01
+
+    mid_price = fx_today_price
 
     up = fx_option_bs(
         spot*(1+bump),
@@ -153,7 +185,7 @@ if run:
     )
 
     delta = (up-down)/(2*spot*bump)
-    gamma = (up-2*fx_pnls.mean()+down)/((spot*bump)**2)
+    gamma = (up - 2*mid_price + down) / ((spot*bump)**2)
 
     vega_up = fx_option_bs(
         spot,
@@ -164,8 +196,7 @@ if run:
         vol_fx+0.01
     )
 
-    vega = (vega_up-fx_pnls.mean())/0.01
-
+    vega = (vega_up-mid_price)/0.01
 
     # =====================
     # DISPLAY
@@ -182,9 +213,8 @@ if run:
 
         st.plotly_chart(fig,use_container_width=True)
 
-        st.metric("VaR 95%",f"{var_irs:,.0f}")
-        st.metric("ES 95%",f"{es_irs:,.0f}")
-
+        st.metric("VaR 95%",f"{var_irs:,.4f}")
+        st.metric("ES 95%",f"{es_irs:,.4f}")
 
     with col2:
 
@@ -200,7 +230,6 @@ if run:
         st.metric("Delta",f"{delta:.4f}")
         st.metric("Gamma",f"{gamma:.4f}")
         st.metric("Vega",f"{vega:.4f}")
-
 
     # =============================
     # Option Surface Pricing
@@ -244,3 +273,129 @@ if run:
     )
 
     st.plotly_chart(fig,use_container_width=True)
+    # =============================
+    # PATH VISUALIZATION (PRO LEVEL)
+    # =============================
+
+    st.subheader("Market Simulation Paths")
+
+    # -----------------------------
+    # Rates Paths + Confidence Bands
+    # -----------------------------
+
+    st.markdown("### Interest Rate Simulation")
+
+    rates_mean = np.mean(rates, axis=0)
+    rates_p5 = np.percentile(rates, 5, axis=0)
+    rates_p95 = np.percentile(rates, 95, axis=0)
+
+    fig_rates = go.Figure()
+
+    # Individual paths (light)
+    for i in range(min(30, n_scenarios)):
+        fig_rates.add_trace(
+            go.Scatter(
+                y=rates[i],
+                mode="lines",
+                line=dict(width=1),
+                opacity=0.2,
+                name="Path"
+            )
+        )
+
+    # Mean path
+    fig_rates.add_trace(
+        go.Scatter(
+            y=rates_mean,
+            mode="lines",
+            line=dict(width=3),
+            name="Mean Path"
+        )
+    )
+
+    # Confidence bands
+    fig_rates.add_trace(
+        go.Scatter(
+            y=rates_p95,
+            fill=None,
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False
+        )
+    )
+
+    fig_rates.add_trace(
+        go.Scatter(
+            y=rates_p5,
+            fill="tonexty",
+            mode="lines",
+            line=dict(width=0),
+            name="95% Confidence Band"
+        )
+    )
+
+    fig_rates.update_layout(
+        xaxis_title="Time",
+        yaxis_title="Interest Rate"
+    )
+
+    st.plotly_chart(fig_rates, use_container_width=True)
+
+
+    # -----------------------------
+    # FX Paths + Confidence Bands
+    # -----------------------------
+
+    st.markdown("### FX Simulation")
+
+    fx_mean = np.mean(fx_paths, axis=0)
+    fx_p5 = np.percentile(fx_paths, 5, axis=0)
+    fx_p95 = np.percentile(fx_paths, 95, axis=0)
+
+    fig_fx = go.Figure()
+
+    for i in range(min(30, n_scenarios)):
+        fig_fx.add_trace(
+            go.Scatter(
+                y=fx_paths[i],
+                mode="lines",
+                line=dict(width=1),
+                opacity=0.2
+            )
+        )
+
+    fig_fx.add_trace(
+        go.Scatter(
+            y=fx_mean,
+            mode="lines",
+            line=dict(width=3),
+            name="Mean Path"
+        )
+    )
+
+    fig_fx.add_trace(
+        go.Scatter(
+            y=fx_p95,
+            fill=None,
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False
+        )
+    )
+
+    fig_fx.add_trace(
+        go.Scatter(
+            y=fx_p5,
+            fill="tonexty",
+            mode="lines",
+            line=dict(width=0),
+            name="95% Confidence Band"
+        )
+    )
+
+    fig_fx.update_layout(
+        xaxis_title="Time",
+        yaxis_title="FX Rate"
+    )
+
+    st.plotly_chart(fig_fx, use_container_width=True)    
