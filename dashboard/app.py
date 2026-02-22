@@ -1,205 +1,246 @@
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+sys.path.append(
+    os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..")
+    )
+)
+
+from src.quant_engine import *
 
 import streamlit as st
 import plotly.graph_objs as go
 import numpy as np
 
-from src.simulation import simulate_rates, simulate_fx
-from src.pricing import irs_npv, fx_option_price
 
-
-# ==================================
-# PAGE CONFIG
-# ==================================
+# =========================
+# UI
+# =========================
 
 st.set_page_config(layout="wide")
-st.title("🏦 Quant Multi-Asset Structuring Platform")
+st.title("🏦 Quant Multi Asset Desk")
+
+st.sidebar.header("Market Params")
+
+n_scenarios = st.sidebar.slider("MC Scenarios",500,5000,2000,step=100)
+
+initial_rate = st.sidebar.slider("Initial Rate",0.0,0.1,0.02,0.005)
+vol_rate = st.sidebar.slider("Rate Vol",0.001,0.05,0.01,0.001)
+
+spot = st.sidebar.number_input("FX Spot",1.12)
+strike = st.sidebar.number_input("FX Strike",1.10)
+vol_fx = st.sidebar.slider("FX Vol",0.05,0.5,0.12,0.01)
+
+fixed_rate = st.sidebar.slider("IRS Fixed Rate",0.0,0.1,0.025,0.002)
+notional = st.sidebar.number_input("Notional",100_000_000)
+
+corr = st.sidebar.slider("Rate FX Corr",-1.,1.,0.)
+
+run = st.sidebar.button("Run Simulation")
 
 
-# ==================================
-# SIDEBAR PARAMETERS
-# ==================================
+# =========================
+# SIMULATION
+# =========================
 
-st.sidebar.header("Market Parameters")
-
-n_scenarios = st.sidebar.slider("Monte Carlo Scenarios", 100, 5000, 1000, step=100)
-
-initial_rate = st.sidebar.slider("Initial Rate", 0.0, 0.1, 0.02, step=0.005)
-vol_rate = st.sidebar.slider("Rate Volatility", 0.001, 0.05, 0.01, step=0.001)
-
-spot = st.sidebar.number_input("FX Spot", value=1.12)
-strike = st.sidebar.number_input("FX Strike", value=1.10)
-vol_fx = st.sidebar.slider("FX Volatility", 0.05, 0.5, 0.12, step=0.01)
-
-fixed_rate = st.sidebar.slider("IRS Fixed Rate", 0.0, 0.1, 0.025, step=0.002)
-notional = st.sidebar.number_input("IRS Notional", value=100_000_000)
-
-correlation = st.sidebar.slider("Rate/FX Correlation", -1.0, 1.0, 0.0, step=0.1)
-
-stress_rates = st.sidebar.slider("Stress Rates (bps)", -200, 200, 0)
-stress_fx = st.sidebar.slider("Stress FX (%)", -20, 20, 0)
-
-
-run_simulation = st.sidebar.button("🚀 Run Simulation")
-
-
-# ==================================
-# RUN SIMULATION
-# ==================================
-
-if run_simulation:
-
-    # =============================
-    # Correlated Monte Carlo
-    # =============================
+if run:
 
     dt = 1/50
-    cov_matrix = [[1, correlation], [correlation, 1]]
-    chol = np.linalg.cholesky(cov_matrix)
+    n_steps = 50
 
-    rates = np.zeros((n_scenarios, 51))
-    fx_paths = np.zeros((n_scenarios, 51))
+    cov = [[1,corr],[corr,1]]
+    chol = np.linalg.cholesky(cov)
 
-    rates[:,0] = initial_rate
-    fx_paths[:,0] = spot
+    z = np.random.normal(size=(n_scenarios,n_steps,2))
+    corr_z = z @ chol.T
 
-    for t in range(1, 51):
+    # =====================
+    # Hull White Rates
+    # =====================
 
-        z = np.random.normal(size=(n_scenarios, 2))
-        correlated_z = z @ chol.T
+    hw = HullWhite1F(a=0.1,sigma=vol_rate)
 
-        rates[:,t] = rates[:,t-1] + vol_rate * rates[:,t-1] * correlated_z[:,0] * np.sqrt(dt)
-        fx_paths[:,t] = fx_paths[:,t-1] * np.exp(( -0.5 * vol_fx**2) * dt + vol_fx * correlated_z[:,1] * np.sqrt(dt))
+    curve = np.full(n_steps,initial_rate)
+    theta = hw.calibrate_theta(curve,dt)
 
-    # Apply stress
-    rates += stress_rates / 10000
-    fx_paths *= (1 + stress_fx/100)
+    rates = hw.simulate(
+        initial_rate,
+        theta,
+        dt,
+        n_steps,
+        n_scenarios
+    )
 
+    # =====================
+    # FX Simulation
+    # =====================
 
-    maturities = np.arange(1, 6)
-    discount_curve = np.mean(rates, axis=0)
+    fx_model = FXModel(vol_fx)
 
+    fx_paths = fx_model.simulate(
+        spot,
+        rates,
+        np.zeros_like(rates),
+        corr_z[:,:,0],
+        dt
+    )
 
-    # =============================
-    # IRS Monte Carlo
-    # =============================
+    # =====================
+    # IRS Pricing
+    # =====================
 
-    npv_results = []
+    maturities = np.arange(1,6)
 
-    for scenario in rates:
+    irs_pnls = irs_price_mc(
+        rates,
+        notional,
+        fixed_rate,
+        maturities,
+        np.mean(np.exp(-np.cumsum(rates,axis=1)*dt),axis=0)
+    )
 
-        forward_curve = scenario[:len(maturities)]
-
-        npv = irs_npv(
-            notional,
-            fixed_rate,
-            forward_curve,
-            maturities,
-            lambda t, dc=discount_curve: dc[min(t-1, len(dc)-1)]
-        )
-
-        npv_results.append(np.mean(npv))
-
-    npv_results = np.array(npv_results)
-
-    mean_npv = np.mean(npv_results)
-    std_npv = np.std(npv_results)
-    var_95 = np.percentile(npv_results, 5)
-    es_95 = np.mean(npv_results[npv_results <= var_95])
-
-
-    # =============================
-    # FX Option Monte Carlo
-    # =============================
+    # =====================
+    # FX Pricing
+    # =====================
 
     fx_pnls = []
 
     for path in fx_paths:
-        price = fx_option_price(
-            path[-1],
-            strike,
-            1,
-            0.01,
-            0.005,
-            vol_fx,
-            "call"
+
+        fx_pnls.append(
+            fx_option_bs(
+                path[-1],
+                strike,
+                1,
+                initial_rate,
+                0,
+                vol_fx
+            )
         )
-        fx_pnls.append(price)
 
     fx_pnls = np.array(fx_pnls)
 
-    mean_fx = np.mean(fx_pnls)
-    std_fx = np.std(fx_pnls)
-    var_fx = np.percentile(fx_pnls, 5)
-    es_fx = np.mean(fx_pnls[fx_pnls <= var_fx])
+    # =====================
+    # Risk Metrics
+    # =====================
 
+    var_irs, es_irs = var_es(irs_pnls)
+    var_fx, es_fx = var_es(fx_pnls)
 
-    # =============================
-    # Greeks (finite difference)
-    # =============================
+    # =====================
+    # Greeks
+    # =====================
 
     bump = 0.01
 
-    price_up = fx_option_price(spot*(1+bump), strike, 1, 0.01, 0.005, vol_fx, "call")
-    price_down = fx_option_price(spot*(1-bump), strike, 1, 0.01, 0.005, vol_fx, "call")
+    up = fx_option_bs(
+        spot*(1+bump),
+        strike,
+        1,
+        initial_rate,
+        0,
+        vol_fx
+    )
 
-    delta = (price_up - price_down) / (2*spot*bump)
-    gamma = (price_up - 2*mean_fx + price_down) / ((spot*bump)**2)
+    down = fx_option_bs(
+        spot*(1-bump),
+        strike,
+        1,
+        initial_rate,
+        0,
+        vol_fx
+    )
 
-    vega_up = fx_option_price(spot, strike, 1, 0.01, 0.005, vol_fx+0.01, "call")
-    vega = (vega_up - mean_fx) / 0.01
+    delta = (up-down)/(2*spot*bump)
+    gamma = (up-2*fx_pnls.mean()+down)/((spot*bump)**2)
+
+    vega_up = fx_option_bs(
+        spot,
+        strike,
+        1,
+        initial_rate,
+        0,
+        vol_fx+0.01
+    )
+
+    vega = (vega_up-fx_pnls.mean())/0.01
 
 
-    # =============================
+    # =====================
     # DISPLAY
-    # =============================
+    # =====================
 
-    col1, col2 = st.columns(2)
+    col1,col2 = st.columns(2)
 
     with col1:
+
         st.subheader("IRS Risk")
 
-        fig1 = go.Figure()
-        fig1.add_trace(go.Histogram(x=npv_results, nbinsx=40))
-        st.plotly_chart(fig1, use_container_width=True)
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=irs_pnls))
 
-        st.metric("Mean", f"{mean_npv:,.0f}")
-        st.metric("Std", f"{std_npv:,.0f}")
-        st.metric("VaR 95%", f"{var_95:,.0f}")
-        st.metric("ES 95%", f"{es_95:,.0f}")
+        st.plotly_chart(fig,use_container_width=True)
+
+        st.metric("VaR 95%",f"{var_irs:,.0f}")
+        st.metric("ES 95%",f"{es_irs:,.0f}")
+
 
     with col2:
-        st.subheader("FX Option Risk")
 
-        fig2 = go.Figure()
-        fig2.add_trace(go.Histogram(x=fx_pnls, nbinsx=40))
-        st.plotly_chart(fig2, use_container_width=True)
+        st.subheader("FX Risk")
 
-        st.metric("Mean", f"{mean_fx:,.4f}")
-        st.metric("Std", f"{std_fx:,.4f}")
-        st.metric("VaR 95%", f"{var_fx:,.4f}")
-        st.metric("ES 95%", f"{es_fx:,.4f}")
-        st.metric("Delta", f"{delta:.4f}")
-        st.metric("Gamma", f"{gamma:.4f}")
-        st.metric("Vega", f"{vega:.4f}")
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=fx_pnls))
+
+        st.plotly_chart(fig,use_container_width=True)
+
+        st.metric("VaR 95%",f"{var_fx:,.4f}")
+        st.metric("ES 95%",f"{es_fx:,.4f}")
+        st.metric("Delta",f"{delta:.4f}")
+        st.metric("Gamma",f"{gamma:.4f}")
+        st.metric("Vega",f"{vega:.4f}")
 
 
     # =============================
-    # 3D Vol/Strike Surface
+    # Option Surface Pricing
     # =============================
 
     st.subheader("Option Price Surface")
 
-    strikes = np.linspace(strike*0.8, strike*1.2, 20)
-    vols = np.linspace(vol_fx*0.5, vol_fx*1.5, 20)
+    strikes = np.linspace(strike*0.8, strike*1.2, 25)
+    vols = np.linspace(vol_fx*0.5, vol_fx*1.5, 25)
 
-    surface = np.zeros((len(vols), len(strikes)))
+    surface = np.zeros((len(vols),len(strikes)))
 
-    for i, v in enumerate(vols):
-        for j, k in enumerate(strikes):
-            surface[i,j] = fx_option_price(spot, k, 1, 0.01, 0.005, v, "call")
+    for i,v in enumerate(vols):
+        for j,k in enumerate(strikes):
 
-    fig3 = go.Figure(data=[go.Surface(z=surface, x=strikes, y=vols)])
-    st.plotly_chart(fig3, use_container_width=True)
+            surface[i,j] = fx_option_bs(
+                spot,
+                k,
+                1,
+                initial_rate,
+                0,
+                v
+            )
+
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                z=surface,
+                x=strikes,
+                y=vols
+            )
+        ]
+    )
+
+    fig.update_layout(
+        scene=dict(
+            xaxis_title="Strike",
+            yaxis_title="Vol",
+            zaxis_title="Price"
+        )
+    )
+
+    st.plotly_chart(fig,use_container_width=True)
